@@ -3,6 +3,7 @@ package pmtiles
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,13 +13,18 @@ import (
 	"log"
 	"math"
 	"os"
+	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/RoaringBitmap/roaring/roaring64"
 	"github.com/schollz/progressbar/v3"
+	"golang.org/x/sync/errgroup"
 	"zombiezen.com/go/sqlite"
 )
 
@@ -104,7 +110,10 @@ func newResolver(deduplicate bool, compress bool) *resolver {
 // Convert an existing archive on disk to a new PMTiles specification version 3 archive.
 func Convert(logger *log.Logger, input string, output string, deduplicate bool, tmpfile *os.File) error {
 	if strings.HasSuffix(input, ".pmtiles") {
-		return convertPmtilesV2(logger, input, output, deduplicate, tmpfile)
+		if strings.HasSuffix(output, ".pmtiles") {
+			return convertPmtilesV2(logger, input, output, deduplicate, tmpfile)
+		}
+		return convertToDirectory(logger, input, output, deduplicate)
 	}
 	return convertMbtiles(logger, input, output, deduplicate, tmpfile)
 }
@@ -644,4 +653,234 @@ func mbtilesToHeaderJSON(mbtilesMetadata []string) (HeaderV3, map[string]interfa
 	}
 
 	return header, jsonResult, nil
+}
+
+// ConvertToDirectory extracts a PMTiles file to a standard Z/X/Y directory structure with optimizations
+func convertToDirectory(logger *log.Logger, input string, output string, decompressTiles bool) error {
+	start := time.Now()
+
+	// Open and read the PMTiles file
+	file, err := os.Open(input)
+	if err != nil {
+		return fmt.Errorf("Failed to open file: %w", err)
+	}
+	defer file.Close()
+
+	// Read and parse the header
+	headerBytes := make([]byte, HeaderV3LenBytes)
+	_, err = file.Read(headerBytes)
+	if err != nil {
+		return fmt.Errorf("Failed to read header: %w", err)
+	}
+
+	header, err := DeserializeHeader(headerBytes)
+	if err != nil {
+		return fmt.Errorf("Failed to parse header: %w", err)
+	}
+
+	// Create the output directory if it doesn't exist
+	err = os.MkdirAll(output, 0755)
+	if err != nil {
+		return fmt.Errorf("Failed to create output directory: %w", err)
+	}
+
+	// Get the tile file extension based on the tile type
+	var extension string
+	switch header.TileType {
+	case Mvt:
+		extension = ".mvt"
+	case Png:
+		extension = ".png"
+	case Jpeg:
+		extension = ".jpg"
+	case Webp:
+		extension = ".webp"
+	case Avif:
+		extension = ".avif"
+	default:
+		extension = ""
+	}
+
+	// Save metadata.json if present
+	if header.MetadataLength > 0 {
+		metadataReader := io.NewSectionReader(file, int64(header.MetadataOffset), int64(header.MetadataLength))
+		metadataBytes, err := DeserializeMetadataBytes(metadataReader, header.InternalCompression)
+		if err != nil {
+			return fmt.Errorf("Failed to read metadata: %w", err)
+		}
+
+		metadataPath := filepath.Join(output, "metadata.json")
+		err = os.WriteFile(metadataPath, metadataBytes, 0644)
+		if err != nil {
+			return fmt.Errorf("Failed to write metadata.json: %w", err)
+		}
+
+		logger.Printf("Wrote metadata.json to %s", metadataPath)
+	}
+
+	// Collect all tile entries first
+	allEntries := make([]EntryV3, 0)
+	err = IterateEntries(header,
+		func(offset uint64, length uint64) ([]byte, error) {
+			// This function reads a section of the directory
+			return io.ReadAll(io.NewSectionReader(file, int64(offset), int64(length)))
+		},
+		func(entry EntryV3) {
+			allEntries = append(allEntries, entry)
+		})
+
+	if err != nil {
+		return fmt.Errorf("Failed to iterate through tiles: %w", err)
+	}
+
+	// Create a progress bar
+	bar := progressbar.Default(int64(header.AddressedTilesCount), "Extracting tiles")
+
+	// Use a concurrent-safe map for directory caching
+	dirCache := &sync.Map{}
+
+	// Number of worker goroutines
+	numWorkers := runtime.NumCPU()
+
+	// Use a file handle per worker to avoid contention
+	type workerData struct {
+		file *os.File
+		// Reuse these buffers for tile data
+		tileBuffer   []byte
+		decompBuffer bytes.Buffer
+	}
+
+	// Create worker data structures
+	workers := make([]workerData, numWorkers)
+	for i := range workers {
+		f, err := os.Open(input)
+		if err != nil {
+			return fmt.Errorf("Failed to open additional file handle: %w", err)
+		}
+		defer f.Close()
+		workers[i] = workerData{
+			file: f,
+			// Start with a reasonable buffer size
+			tileBuffer: make([]byte, 4096),
+		}
+	}
+
+	// Use atomic counter for processed tiles
+	var processedTiles int64 = 0
+
+	// Create error group for coordinated error handling
+	g, _ := errgroup.WithContext(context.Background())
+
+	// Process tiles in batches
+	entriesPerWorker := (len(allEntries) + numWorkers - 1) / numWorkers
+
+	// Start worker goroutines
+	for i := range numWorkers {
+		workerID := i
+		startIdx := workerID * entriesPerWorker
+		endIdx := min((workerID+1)*entriesPerWorker, len(allEntries))
+
+		// Skip if this worker has no entries to process
+		if startIdx >= len(allEntries) {
+			continue
+		}
+
+		g.Go(func() error {
+			w := &workers[workerID]
+
+			// Process assigned entries
+			for entryIdx := startIdx; entryIdx < endIdx; entryIdx++ {
+				entry := allEntries[entryIdx]
+
+				// Ensure buffer is large enough
+				if int(entry.Length) > cap(w.tileBuffer) {
+					w.tileBuffer = make([]byte, entry.Length)
+				} else {
+					w.tileBuffer = w.tileBuffer[:entry.Length]
+				}
+
+				// Read tile data
+				_, err := w.file.ReadAt(w.tileBuffer, int64(header.TileDataOffset+entry.Offset))
+				if err != nil {
+					return fmt.Errorf("Failed to read tile data: %w", err)
+				}
+
+				// If requested and the tile is compressed, uncompress it
+				var processedData []byte
+				if decompressTiles && header.TileCompression == Gzip {
+					reader, err := gzip.NewReader(bytes.NewReader(w.tileBuffer))
+					if err != nil {
+						logger.Printf("Failed to create gzip reader: %v", err)
+						continue
+					}
+
+					w.decompBuffer.Reset()
+					_, err = io.Copy(&w.decompBuffer, reader)
+					reader.Close()
+					if err != nil {
+						logger.Printf("Failed to uncompress tile data: %v", err)
+						continue
+					}
+					processedData = w.decompBuffer.Bytes()
+				} else {
+					processedData = w.tileBuffer
+				}
+
+				// Handle each tile in the run
+				for i := uint32(0); i < entry.RunLength; i++ {
+					currentTileID := entry.TileID + uint64(i)
+					z, x, y := IDToZxy(currentTileID)
+
+					// Create the directory path for this tile
+					zDir := filepath.Join(output, fmt.Sprintf("%d", z))
+					dirPath := filepath.Join(zDir, fmt.Sprintf("%d", x))
+
+					// Check if directories have been created already, if not create them
+					if _, exists := dirCache.Load(dirPath); !exists {
+						// First check if the zoom level directory exists
+						if _, exists := dirCache.Load(zDir); !exists {
+							err := os.MkdirAll(zDir, 0755)
+							if err != nil {
+								logger.Printf("Failed to create directory %s: %v", zDir, err)
+								continue
+							}
+							dirCache.Store(zDir, struct{}{})
+						}
+
+						// Now create the x directory
+						err := os.Mkdir(dirPath, 0755)
+						if err != nil && !os.IsExist(err) {
+							logger.Printf("Failed to create directory %s: %v", dirPath, err)
+							continue
+						}
+						dirCache.Store(dirPath, struct{}{})
+					}
+
+					// Save the tile
+					tilePath := filepath.Join(dirPath, fmt.Sprintf("%d%s", y, extension))
+					err := os.WriteFile(tilePath, processedData, 0644)
+					if err != nil {
+						logger.Printf("Failed to write tile to %s: %v", tilePath, err)
+						continue
+					}
+
+					// Update the progress bar
+					newCount := atomic.AddInt64(&processedTiles, 1)
+					if newCount%10000 == 0 {
+						bar.Set(int(newCount))
+					}
+				}
+			}
+
+			return nil
+		})
+	}
+
+	// Wait for all workers to finish or for an error to occur
+	if err := g.Wait(); err != nil {
+		return err
+	}
+
+	logger.Printf("Extracted %d tiles to %s in %v", processedTiles, output, time.Since(start))
+	return nil
 }
