@@ -718,6 +718,7 @@ func convertToDirectory(logger *log.Logger, input string, output string) error {
 	}
 
 	// Collect all tile entries
+	logger.Println("Reading all entry headers")
 	allEntries := make([]EntryV3, 0)
 	err = IterateEntries(header,
 		func(offset uint64, length uint64) ([]byte, error) {
@@ -733,12 +734,12 @@ func convertToDirectory(logger *log.Logger, input string, output string) error {
 	}
 
 	// Create a progress bar
-	bar := progressbar.Default(int64(header.AddressedTilesCount), "Extracting tiles")
+	bar := progressbar.Default(int64(header.TileEntriesCount), "Extracting tiles")
 	// Use atomic counter for processed tiles
 	var processedTiles uint32 = 0
 
 	// Number of worker goroutines
-	numWorkers := runtime.NumCPU() * 2
+	numWorkers := runtime.NumCPU()
 
 	// Channel for tile processing tasks
 	type tileTask struct {
@@ -767,7 +768,9 @@ func convertToDirectory(logger *log.Logger, input string, output string) error {
 							fmt.Sprintf("%d", z),
 							fmt.Sprintf("%d", x),
 							fmt.Sprintf("%d%s", y, extension))
-						err := os.WriteFile(tilePath, task.tileData, 0644)
+						//err := os.WriteFile(tilePath, task.tileData, 0644)
+						err := writeFileNFS(tilePath, task.tileData, 0644)
+
 						if err != nil {
 							logger.Printf("Failed to write tile to %s: %v", tilePath, err)
 							continue
@@ -906,4 +909,24 @@ func generateDirectoryStructure(logger *log.Logger, output string, maxZoom uint8
 
 	logger.Println("Directory structure created.")
 	return nil
+}
+
+func writeFileNFS(path string, data []byte, perm os.FileMode) error {
+	// Create the file with appropriate flags for NFS
+	// O_SYNC can help ensure data is written to the server before returning
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|os.O_SYNC, perm)
+	if err != nil {
+		return err
+	}
+
+	// Use a single write operation instead of multiple small ones
+	_, err = f.Write(data)
+
+	// Explicitly close to ensure all data is flushed
+	closeErr := f.Close()
+	if err == nil {
+		return closeErr
+	}
+
+	return err
 }
